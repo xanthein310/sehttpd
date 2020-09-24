@@ -14,7 +14,7 @@ CFLAGS += -O2
 CFLAGS += -std=gnu99 -Wall -W
 CFLAGS += -DUNUSED="__attribute__((unused))"
 CFLAGS += -DNDEBUG
-LDFLAGS =
+LDFLAGS = -lpthread
 
 # standard build rules
 .SUFFIXES: .o .c
@@ -23,6 +23,7 @@ LDFLAGS =
 	$(Q)$(CC) -o $@ $(CFLAGS) -c -MMD -MF $@.d $<
 
 OBJS = \
+    src/threadpool.o \
     src/http.o \
     src/http_parser.o \
     src/http_request.o \

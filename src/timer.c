@@ -1,4 +1,5 @@
 #include <assert.h>
+#include <pthread.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/time.h>
@@ -139,6 +140,7 @@ static int timer_comp(void *ti, void *tj)
 
 static prio_queue_t timer;
 static size_t current_msec;
+static pthread_mutex_t lock;
 
 static void time_update()
 {
@@ -221,8 +223,12 @@ void add_timer(http_request_t *req, size_t timeout, timer_callback cb)
     node->callback = cb;
     node->request = req;
 
+    if (pthread_mutex_lock(&lock) != 0)
+        printf("pthread_mutex_lock failed\n");
     bool ret UNUSED = prio_queue_insert(&timer, node);
     assert(ret && "add_timer: prio_queue_insert error");
+    if (pthread_mutex_unlock(&lock) != 0)
+        printf("pthread_mutex_lock failed\n");
 }
 
 void del_timer(http_request_t *req)

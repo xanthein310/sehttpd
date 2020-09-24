@@ -11,6 +11,7 @@
 
 #include "http.h"
 #include "logger.h"
+#include "threadpool.h"
 #include "timer.h"
 
 /* the length of the struct epoll_events array pointed to by *events */
@@ -84,6 +85,9 @@ int main()
         log_err("Failed to install sigal handler for SIGPIPE");
         return 0;
     }
+
+    threadpool_t *pool = threadpool_create(4, 30, 0);
+    assert(pool == NULL && "threadpool_create");
 
     int listenfd = open_listenfd(PORT);
     int rc UNUSED = sock_set_non_blocking(listenfd);
@@ -160,10 +164,14 @@ int main()
                     continue;
                 }
 
-                do_request(events[i].data.ptr);
+                while (threadpool_add(pool, &do_request, events[i].data.ptr,
+                                      0) < 0)
+                    ;
             }
         }
     }
+
+    assert(threadpool_destroy(pool, 0) == 0);
 
     return 0;
 }
