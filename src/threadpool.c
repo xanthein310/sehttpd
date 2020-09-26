@@ -32,6 +32,7 @@
  */
 
 #include <pthread.h>
+#include <signal.h>
 #include <stdlib.h>
 #include <unistd.h>
 
@@ -55,6 +56,13 @@ typedef struct {
     void *argument;
 } threadpool_task_t;
 
+typedef struct {
+    threadpool_task_t *queue;
+    int head;
+    int tail;
+    volatile int count;
+} thread_t;
+
 /**
  *  @struct threadpool
  *  @brief The threadpool struct
@@ -71,17 +79,12 @@ typedef struct {
  *  @var started      Number of started threads
  */
 struct threadpool_t {
-    pthread_mutex_t lock;
-    pthread_cond_t notify;
     pthread_t *threads;
-    threadpool_task_t *queue;
     int thread_count;
     int queue_size;
-    int head;
-    int tail;
-    int count;
-    int shutdown;
     int started;
+    int shutdown;
+    thread_t *thread_data;
 };
 
 /**
@@ -93,10 +96,14 @@ static void *threadpool_thread(void *threadpool);
 
 int threadpool_free(threadpool_t *pool);
 
+static void sig_do_nothing(int signo)
+{
+    return;
+}
+
 threadpool_t *threadpool_create(int thread_count, int queue_size, int flags)
 {
     threadpool_t *pool;
-    int i;
     (void) flags;
 
     if (thread_count <= 0 || thread_count > MAX_THREADS || queue_size <= 0 ||
@@ -111,23 +118,29 @@ threadpool_t *threadpool_create(int thread_count, int queue_size, int flags)
     /* Initialize */
     pool->thread_count = 0;
     pool->queue_size = queue_size;
-    pool->head = pool->tail = pool->count = 0;
     pool->shutdown = pool->started = 0;
 
     /* Allocate thread and task queue */
     pool->threads = (pthread_t *) malloc(sizeof(pthread_t) * thread_count);
-    pool->queue =
-        (threadpool_task_t *) malloc(sizeof(threadpool_task_t) * queue_size);
+    pool->thread_data = (thread_t *) malloc(sizeof(thread_t) * thread_count);
+    for (int i = 0; i < thread_count; i++) {
+        pool->thread_data[i].queue = (threadpool_task_t *) malloc(
+            sizeof(threadpool_task_t) * queue_size);
+        pool->thread_data[i].head = 0;
+        pool->thread_data[i].tail = 0;
+        pool->thread_data[i].count = 0;
+    }
 
+    if (signal(SIGUSR1, sig_do_nothing) == SIG_ERR)
+        printf("signal failed");
     /* Initialize mutex and conditional variable first */
-    if ((pthread_mutex_init(&(pool->lock), NULL) != 0) ||
-        (pthread_cond_init(&(pool->notify), NULL) != 0) ||
-        (pool->threads == NULL) || (pool->queue == NULL)) {
+    if ((pool->threads == NULL) || (pool->thread_data == NULL) ||
+        (pool->thread_data->queue == NULL)) {
         goto err;
     }
 
     /* Start worker threads */
-    for (i = 0; i < thread_count; i++) {
+    for (int i = 0; i < thread_count; i++) {
         if (pthread_create(&(pool->threads[i]), NULL, threadpool_thread,
                            (void *) pool) != 0) {
             threadpool_destroy(pool, 0);
@@ -152,24 +165,23 @@ int threadpool_add(threadpool_t *pool,
                    int flags)
 {
     int err = 0;
-    int next;
     (void) flags;
+
+    static int cur_thread_index = -1;
 
     if (pool == NULL || function == NULL) {
         return threadpool_invalid;
     }
 
-    if (pthread_mutex_lock(&(pool->lock)) != 0) {
-        return threadpool_lock_failure;
-    }
-
-    next = (pool->tail + 1) % pool->queue_size;
-
     do {
+        cur_thread_index = (cur_thread_index + 1) % pool->thread_count;
+        thread_t *thread_data = pool->thread_data + cur_thread_index;
+        int next = (thread_data->tail + 1) % pool->queue_size;
+
         /* Are we full ? */
-        if (pool->count == pool->queue_size) {
-            err = threadpool_queue_full;
-            break;
+        if (__sync_bool_compare_and_swap(&(thread_data->count),
+                                         pool->queue_size, pool->queue_size)) {
+            continue;
         }
 
         /* Are we shutting down ? */
@@ -179,21 +191,13 @@ int threadpool_add(threadpool_t *pool,
         }
 
         /* Add task to queue */
-        pool->queue[pool->tail].function = function;
-        pool->queue[pool->tail].argument = argument;
-        pool->tail = next;
-        pool->count += 1;
-
-        /* pthread_cond_broadcast */
-        if (pthread_cond_signal(&(pool->notify)) != 0) {
-            err = threadpool_lock_failure;
-            break;
-        }
-    } while (0);
-
-    if (pthread_mutex_unlock(&pool->lock) != 0) {
-        err = threadpool_lock_failure;
-    }
+        thread_data->queue[thread_data->tail].function = function;
+        thread_data->queue[thread_data->tail].argument = argument;
+        thread_data->tail = next;
+        __sync_fetch_and_add(&(thread_data->count), 1);
+        pthread_kill(pool->threads[cur_thread_index], SIGUSR1);
+        break;
+    } while (1);
 
     return err;
 }
@@ -206,10 +210,6 @@ int threadpool_destroy(threadpool_t *pool, int flags)
         return threadpool_invalid;
     }
 
-    if (pthread_mutex_lock(&(pool->lock)) != 0) {
-        return threadpool_lock_failure;
-    }
-
     do {
         /* Already shutting down */
         if (pool->shutdown) {
@@ -220,15 +220,9 @@ int threadpool_destroy(threadpool_t *pool, int flags)
         pool->shutdown = (flags & threadpool_graceful) ? graceful_shutdown
                                                        : immediate_shutdown;
 
-        /* Wake up all worker threads */
-        if ((pthread_cond_broadcast(&(pool->notify)) != 0) ||
-            (pthread_mutex_unlock(&(pool->lock)) != 0)) {
-            err = threadpool_lock_failure;
-            break;
-        }
-
         /* Join all worker thread */
         for (i = 0; i < pool->thread_count; i++) {
+            pthread_kill(pool->threads[i], SIGUSR1);
             if (pthread_join(pool->threads[i], NULL) != 0) {
                 err = threadpool_thread_failure;
             }
@@ -251,14 +245,8 @@ int threadpool_free(threadpool_t *pool)
     /* Did we manage to allocate ? */
     if (pool->threads) {
         free(pool->threads);
-        free(pool->queue);
-
-        /* Because we allocate pool->threads after initializing the
-           mutex and condition variable, we're sure they're
-           initialized. Let's lock the mutex just in case. */
-        pthread_mutex_lock(&(pool->lock));
-        pthread_mutex_destroy(&(pool->lock));
-        pthread_cond_destroy(&(pool->notify));
+        free(pool->thread_data->queue);
+        free(pool->thread_data);
     }
     free(pool);
     return 0;
@@ -269,38 +257,54 @@ static void *threadpool_thread(void *threadpool)
 {
     threadpool_t *pool = (threadpool_t *) threadpool;
     threadpool_task_t task;
+    thread_t *thread_data;
+    sigset_t newmask, oldmask;
+    int sig_caught;
+
+    for (int i = 0; i < pool->thread_count; i++) {
+        if (pool->threads[i] == pthread_self()) {
+            thread_data = pool->thread_data + i;
+            break;
+        }
+    }
+
+    sigemptyset(&oldmask);
+    sigemptyset(&newmask);
+    sigaddset(&newmask, SIGUSR1);
 
     for (;;) {
-        /* Lock must be taken to wait on conditional variable */
-        pthread_mutex_lock(&(pool->lock));
+        if (pthread_sigmask(SIG_BLOCK, &newmask, &oldmask) != 0)
+            printf("set SIG_BLOCK failed\n");
 
-        /* Wait on condition variable, check for spurious wakeups.
-           When returning from pthread_cond_wait(), we own the lock. */
-        while ((pool->count == 0) && (!pool->shutdown)) {
-            pthread_cond_wait(&(pool->notify), &(pool->lock));
+        while (__sync_bool_compare_and_swap(&(thread_data->count), 0, 0) &&
+               !pool->shutdown) {
+            int rc = sigwait(&newmask, &sig_caught);
+            if (rc != 0)
+                printf("sigwait failed\n");
         }
 
+        if (pthread_sigmask(SIG_SETMASK, &oldmask, NULL) != 0)
+            printf("set SIG_BLOCK failed\n");
+
         if ((pool->shutdown == immediate_shutdown) ||
-            ((pool->shutdown == graceful_shutdown) && (pool->count == 0))) {
+            ((pool->shutdown == graceful_shutdown) &&
+             __sync_bool_compare_and_swap(&(thread_data->count), 0, 0))) {
             break;
         }
 
         /* Grab our task */
-        task.function = pool->queue[pool->head].function;
-        task.argument = pool->queue[pool->head].argument;
-        pool->head = (pool->head + 1) % pool->queue_size;
-        pool->count -= 1;
-
-        /* Unlock */
-        pthread_mutex_unlock(&(pool->lock));
+        task.function = thread_data->queue[thread_data->head].function;
+        task.argument = thread_data->queue[thread_data->head].argument;
+        thread_data->head = (thread_data->head + 1) % pool->queue_size;
+        __sync_fetch_and_sub(&(thread_data->count), 1);
 
         /* Get to work */
         (*(task.function))(task.argument);
     }
 
-    pool->started--;
+    __sync_fetch_and_sub(&pool->started, 1);
 
-    pthread_mutex_unlock(&(pool->lock));
     pthread_exit(NULL);
+
     return (NULL);
 }

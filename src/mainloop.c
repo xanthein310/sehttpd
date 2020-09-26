@@ -86,7 +86,7 @@ int main()
         return 0;
     }
 
-    threadpool_t *pool = threadpool_create(4, 30, 0);
+    threadpool_t *pool = threadpool_create(4, 4096, 0);
     assert(pool == NULL && "threadpool_create");
 
     int listenfd = open_listenfd(PORT);
@@ -164,9 +164,7 @@ int main()
                     continue;
                 }
 
-                while (threadpool_add(pool, &do_request, events[i].data.ptr,
-                                      0) < 0)
-                    ;
+                threadpool_add(pool, &do_request, events[i].data.ptr, 0);
             }
         }
     }
